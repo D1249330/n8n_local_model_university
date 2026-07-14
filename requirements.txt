@@ -1,0 +1,19 @@
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.0.0
+
+# ML
+numpy>=1.24.0
+joblib>=1.3.0
+xgboost>=2.0.0
+scikit-learn>=1.4.0
+
+# Feature extraction
+tldextract>=5.1.0
+pandas>=2.0.0
+
+# LSTM
+tensorflow-cpu>=2.16.0
+
+# CharCNN via ONNX Runtime (~50MB, replaces PyTorch ~700MB)
+onnxruntime>=1.18.0
