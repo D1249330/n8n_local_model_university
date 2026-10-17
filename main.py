@@ -1,6 +1,11 @@
 """
 PhishGuard AI - FastAPI Backend
 Serves XGBoost + LSTM + CharCNN ensemble predictions for phishing URL detection.
+
+模型版本 0802：
+  XGBoost  0802_augmented_xgb_model.ubj（XGBoost 原生格式）+ 0802_augmented_model_config.pkl（門檻）
+  LSTM     0802_lstm_model.keras（模型內含 TextVectorization，輸入是網址字串）+ 0802_lstm_config.json
+  CharCNN  cnn_model.onnx（由 char_cnn_model.pth 經 convert_cnn_to_onnx.py 轉出）+ tokenizer_CNN.pkl
 """
 
 import json
@@ -24,6 +29,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("phishguard")
 
 BASE_DIR = os.path.dirname(__file__)
+MODEL_VERSION = "0802"
 
 # ──────────────────────────────────────────────
 # Model state (loaded once at startup)
@@ -36,51 +42,9 @@ XGB_FEATURE_COLS = [
     "UF23","UF24","UF25","UF26",
 ]
 
-# CharCNN architecture (inferred from state_dict tensor shapes)
+# CharCNN 前處理參數（模型結構見 convert_cnn_to_onnx.py；Render 上只用 ONNX，不需要 PyTorch）
 CNN_MAX_LEN = 200
-CNN_EMB_DIM = 64
-
-
-# ──────────────────────────────────────────────
-# CharCNN model definition
-# ──────────────────────────────────────────────
-def build_char_cnn(vocab_size: int):
-    """
-    Architecture inferred from state_dict:
-      Embedding(vocab_size, 64)
-      Conv1d(64→128, k=5) + ReLU + GlobalMaxPool
-      Conv1d(128→128, k=3) + ReLU + GlobalMaxPool
-      Conv1d(128→64,  k=3) + ReLU + GlobalMaxPool
-      Linear(64, 64)  + ReLU
-      Linear(64, 1)   + Sigmoid
-    """
-    import torch
-    import torch.nn as nn
-
-    class CharCNN(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.embedding = nn.Embedding(vocab_size, CNN_EMB_DIM, padding_idx=0)
-            self.conv1 = nn.Conv1d(CNN_EMB_DIM, 128, kernel_size=5, padding=2)
-            self.conv2 = nn.Conv1d(128, 128, kernel_size=3, padding=1)
-            self.conv3 = nn.Conv1d(128, 64, kernel_size=3, padding=1)
-            self.fc1 = nn.Linear(64, 64)
-            self.fc2 = nn.Linear(64, 1)
-            self.relu = nn.ReLU()
-
-        def forward(self, x):
-            # x: (B, L)
-            e = self.embedding(x).permute(0, 2, 1)   # (B, 64, L)
-            e = self.relu(self.conv1(e)).max(dim=2)[0]  # (B, 128)
-            # need 3-dim for conv2
-            e = e.unsqueeze(2)
-            e = self.relu(self.conv2(e)).max(dim=2)[0]  # (B, 128)
-            e = e.unsqueeze(2)
-            e = self.relu(self.conv3(e)).max(dim=2)[0]  # (B, 64)
-            e = self.relu(self.fc1(e))
-            return torch.sigmoid(self.fc2(e)).squeeze(1)
-
-    return CharCNN()
+CNN_THRESHOLD = 0.4
 
 
 # ──────────────────────────────────────────────
@@ -90,8 +54,10 @@ def build_char_cnn(vocab_size: int):
 async def lifespan(app: FastAPI):
     # ── XGBoost ──────────────────────────────
     try:
-        xgb_model = joblib.load(os.path.join(BASE_DIR, "0623_augmented_xgb_model.pkl"))
-        xgb_cfg   = joblib.load(os.path.join(BASE_DIR, "0623_augmented_model_config.pkl"))
+        import xgboost as xgb
+        xgb_model = xgb.XGBClassifier()
+        xgb_model.load_model(os.path.join(BASE_DIR, "0802_augmented_xgb_model.ubj"))
+        xgb_cfg   = joblib.load(os.path.join(BASE_DIR, "0802_augmented_model_config.pkl"))
         xgb_threshold = (
             float(xgb_cfg.get("best_threshold", xgb_cfg.get("threshold", 0.35)))
             if isinstance(xgb_cfg, dict) else 0.35
@@ -104,8 +70,8 @@ async def lifespan(app: FastAPI):
     # ── LSTM ─────────────────────────────────
     try:
         import tensorflow as tf
-        lstm_model = tf.keras.models.load_model(os.path.join(BASE_DIR, "0623_lstm_model.keras"))
-        with open(os.path.join(BASE_DIR, "0623_lstm_config.json")) as f:
+        lstm_model = tf.keras.models.load_model(os.path.join(BASE_DIR, "0802_lstm_model.keras"))
+        with open(os.path.join(BASE_DIR, "0802_lstm_config.json")) as f:
             lstm_cfg = json.load(f)
         lstm_threshold = float(lstm_cfg.get("threshold", 0.45))
         _models["lstm"] = {"model": lstm_model, "threshold": lstm_threshold}
@@ -122,7 +88,7 @@ async def lifespan(app: FastAPI):
             os.path.join(BASE_DIR, "cnn_model.onnx"),
             providers=["CPUExecutionProvider"],
         )
-        _models["cnn"] = {"session": sess, "char2idx": char2idx, "threshold": 0.4}
+        _models["cnn"] = {"session": sess, "char2idx": char2idx, "threshold": CNN_THRESHOLD}
         logger.info("CharCNN (ONNX) loaded")
     except Exception as e:
         logger.warning(f"CharCNN not loaded: {e}")
@@ -154,18 +120,16 @@ app.add_middleware(
 from transfer import extract_url_features   # noqa: E402  (local module)
 
 
-def _clean_for_lstm(url: str) -> str:
-    url = re.sub(r"^https?://", "", url, flags=re.IGNORECASE)
-    return url.strip().lower().encode("ascii", "ignore").decode("ascii")
+_SCHEME_RE = re.compile(r"^\s*https?://", re.IGNORECASE)
 
 
-def _encode_for_cnn(url: str, char2idx: dict, max_len: int = CNN_MAX_LEN):
-    import torch
-    clean = re.sub(r"^https?://", "", url, flags=re.IGNORECASE).lower()
-    ids = [char2idx.get(c, 0) for c in clean[:max_len]]
-    # pad
-    ids = ids + [0] * (max_len - len(ids))
-    return torch.tensor([ids], dtype=torch.long)
+def _strip_scheme(url: str) -> str:
+    """訓練資料的網址都沒有 http:// / https://，預測前先拿掉，三個模型都用這個版本。"""
+    return _SCHEME_RE.sub("", url.strip()).strip()
+
+
+def _clean_for_lstm(bare: str) -> str:
+    return bare.lower().encode("ascii", "ignore").decode("ascii")
 
 
 # ──────────────────────────────────────────────
@@ -207,6 +171,9 @@ class PredictionResult(BaseModel):
 # Core prediction logic
 # ──────────────────────────────────────────────
 def _predict_one(url: str) -> PredictionResult:
+    bare = _strip_scheme(url)          # 送進模型的網址（無協定）；回傳時仍用原始 url
+    if not bare:
+        raise HTTPException(status_code=422, detail="url must not be empty")
     scores = {}
     votes = []
     reasons = []
@@ -214,8 +181,10 @@ def _predict_one(url: str) -> PredictionResult:
     # ── XGBoost ──────────────────────────────
     if "xgb" in _models:
         try:
-            feats = extract_url_features(url)
-            x = np.array([[feats.get(c, 0) for c in XGB_FEATURE_COLS]])
+            import pandas as pd
+            feats = extract_url_features(bare)
+            # 用 DataFrame 帶欄位名稱，模型會檢查特徵名稱與順序
+            x = pd.DataFrame([[feats.get(c, 0) for c in XGB_FEATURE_COLS]], columns=XGB_FEATURE_COLS)
             prob = float(_models["xgb"]["model"].predict_proba(x)[0][1])
             scores["xgboost"] = round(prob, 4)
             votes.append(prob >= _models["xgb"]["threshold"])
@@ -227,11 +196,9 @@ def _predict_one(url: str) -> PredictionResult:
     if "lstm" in _models:
         try:
             import tensorflow as tf
-            clean = _clean_for_lstm(url)
-            # character-level integer encoding (same as training: ord, clipped to 128)
-            ids = [min(ord(c), 127) for c in clean[:200]]
-            ids = ids + [0] * (200 - len(ids))
-            x = tf.constant([ids], dtype=tf.int32)
+            clean = _clean_for_lstm(bare)
+            # 模型第一層是 TextVectorization（逐字元切分、長度 200），直接餵網址字串
+            x = tf.constant([[clean]], dtype=tf.string)
             prob = float(_models["lstm"]["model"].predict(x, verbose=0)[0][0])
             scores["lstm"] = round(prob, 4)
             votes.append(prob >= _models["lstm"]["threshold"])
@@ -242,7 +209,7 @@ def _predict_one(url: str) -> PredictionResult:
     if "cnn" in _models:
         try:
             char2idx = _models["cnn"]["char2idx"]
-            clean = re.sub(r"^https?://", "", url, flags=re.IGNORECASE).lower()
+            clean = bare.lower()
             ids = [char2idx.get(c, 0) for c in clean[:CNN_MAX_LEN]]
             ids = ids + [0] * (CNN_MAX_LEN - len(ids))
             x = np.array([ids], dtype=np.int64)
@@ -301,7 +268,12 @@ def _add_reasons(feats: dict, reasons: list):
 # ──────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"status": "ok", "models_loaded": list(_models.keys())}
+    return {
+        "status": "ok",
+        "model_version": MODEL_VERSION,
+        "models_loaded": list(_models.keys()),
+        "thresholds": {k: v.get("threshold") for k, v in _models.items()},
+    }
 
 
 @app.post("/predict", response_model=PredictionResult)
