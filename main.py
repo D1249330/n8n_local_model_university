@@ -121,7 +121,7 @@ from transfer import extract_url_features   # noqa: E402  (local module)
 
 
 _SCHEME_RE = re.compile(r"^\s*https?://", re.IGNORECASE)
-_WWW_RE = re.compile(r"^www\.", re.IGNORECASE)
+_WWW_RE = re.compile(r"^www\d*\.", re.IGNORECASE)   # 和 n8n 一樣：www. / www1. / www2. 都拿掉
 
 
 def _to_domain(url: str) -> str:
@@ -130,7 +130,7 @@ def _to_domain(url: str) -> str:
     1. 拿掉 http:// / https://
     2. 拿掉路徑、查詢字串、#片段（第一個 / ? # 之後全部丟掉）
     3. 拿掉帳號密碼（user@）與 port（:8080）
-    4. 轉小寫、拿掉結尾的點與開頭的 www.
+    4. 轉小寫、拿掉結尾的點與開頭的 www.（含 www1. 這類）
     其他子網域保留（paypal.com.evil.xyz 這類冒用手法要靠它判斷）。
     """
     s = _SCHEME_RE.sub("", url.strip()).strip()

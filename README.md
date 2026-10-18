@@ -32,7 +32,8 @@
 
 ```
 輸入網址
-  │  去掉開頭的 http:// 或 https://（訓練資料都沒有協定）
+  │  縮成網域：去掉 http(s)://、路徑、查詢字串、port、開頭的 www.
+  │  例：https://www.youtube.com/watch?v=abc → youtube.com（與 n8n 流程一致）
   ▼
 ┌──────────────┬──────────────────┬──────────────────┐
 │ XGBoost      │ LSTM             │ CharCNN (ONNX)   │
@@ -51,9 +52,9 @@
 
 | 模型 | 輸入處理 | 門檻 |
 |---|---|---|
-| XGBoost | 去協定後交給 `extract_url_features()`，取 23 個特徵：UF2、UF3、UF4、UF5、UF6、UF8、UF10–UF26（不含 UF1、UF7、UF9），用 DataFrame 帶欄位名稱 | 0.26 |
-| LSTM | 去協定、轉小寫、去掉非 ASCII 字元，以字串送入模型（模型內的 `TextVectorization` 逐字元切分，長度 200） | 0.43 |
-| CharCNN | 去協定、轉小寫，用 `tokenizer_CNN.pkl` 轉成索引（找不到的字元 = 0），截斷或補 0 到長度 200 | 0.40 |
+| XGBoost | 縮成網域後交給 `extract_url_features()`，取 23 個特徵：UF2、UF3、UF4、UF5、UF6、UF8、UF10–UF26（不含 UF1、UF7、UF9），用 DataFrame 帶欄位名稱 | 0.26 |
+| LSTM | 縮成網域、去掉非 ASCII 字元，以字串送入模型（模型內的 `TextVectorization` 逐字元切分，長度 200） | 0.43 |
+| CharCNN | 縮成網域，用 `tokenizer_CNN.pkl` 轉成索引（找不到的字元 = 0），截斷或補 0 到長度 200 | 0.40 |
 
 ### CharCNN 結構
 
@@ -122,7 +123,8 @@ curl -X POST https://n8n-local-model-university.onrender.com/predict \
   "confidence": 0.9999,
   "verdict": "phishing",
   "scores": { "xgboost": 0.9999, "lstm": 0.9999, "cnn": 1.0 },
-  "reasons": ["主機名稱含有連字號 (-)", "使用高風險頂級域名（.sbs / .xyz…）", "含有敏感關鍵字（login / verify / bank…）"]
+  "reasons": ["主機名稱含有連字號 (-)", "使用高風險頂級域名（.sbs / .xyz…）", "含有敏感關鍵字（login / verify / bank…）"],
+  "model_input": "paypa1-secure-login.verify-account.xyz"
 }
 ```
 
@@ -134,6 +136,7 @@ curl -X POST https://n8n-local-model-university.onrender.com/predict \
 | `verdict` | `safe` / `suspicious` / `phishing` |
 | `scores` | 各模型的釣魚機率 |
 | `reasons` | 命中的規則特徵 |
+| `model_input` | 實際送進模型的字串（網域），用來和 n8n 對照 |
 
 錯誤：網址是空的或只有 `https://` → `422`；三個模型都不能用 → `503`。
 
@@ -196,6 +199,13 @@ Render 服務連結這個 repo 的 `main` branch，**push 之後會自動重新�
 ---
 
 ## 更新紀錄
+
+### 0802-domain（2026-10-18）
+
+- 送進模型前把網址縮成網域（去掉協定、路徑、查詢字串、帳號、port、開頭的 `www.`（含 `www1.` 這類），其他子網域保留），與 n8n 流程一致。
+  原因：LSTM / CNN 對「`www.` + 路徑」的正常網址誤判嚴重（例如 `www.youtube.com/watch?v=…` LSTM 0.997）。
+- 代價：只看網域後，路徑上的線索（`/login`、`@`、`%` 編碼）不再列入判斷；冒用子網域、IP 網址的分數也會變低。
+- 回應新增 `model_input` 欄位。
 
 ### 0802（2026-10-17）
 
