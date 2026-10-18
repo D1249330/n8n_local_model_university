@@ -121,11 +121,27 @@ from transfer import extract_url_features   # noqa: E402  (local module)
 
 
 _SCHEME_RE = re.compile(r"^\s*https?://", re.IGNORECASE)
+_WWW_RE = re.compile(r"^www\.", re.IGNORECASE)
 
 
-def _strip_scheme(url: str) -> str:
-    """訓練資料的網址都沒有 http:// / https://，預測前先拿掉，三個模型都用這個版本。"""
-    return _SCHEME_RE.sub("", url.strip()).strip()
+def _to_domain(url: str) -> str:
+    """把網址縮成主機名稱再送進模型，和 n8n 流程一致：
+    https://www.youtube.com/watch?v=abc → youtube.com
+    1. 拿掉 http:// / https://
+    2. 拿掉路徑、查詢字串、#片段（第一個 / ? # 之後全部丟掉）
+    3. 拿掉帳號密碼（user@）與 port（:8080）
+    4. 轉小寫、拿掉結尾的點與開頭的 www.
+    其他子網域保留（paypal.com.evil.xyz 這類冒用手法要靠它判斷）。
+    """
+    s = _SCHEME_RE.sub("", url.strip()).strip()
+    s = re.split(r"[/?#\\]", s, maxsplit=1)[0]
+    s = s.rsplit("@", 1)[-1]
+    if s.startswith("["):                  # IPv6：[::1]:8080
+        s = s.split("]", 1)[0] + "]"
+    else:
+        s = s.split(":", 1)[0]
+    s = s.lower().rstrip(".")
+    return _WWW_RE.sub("", s)
 
 
 def _clean_for_lstm(bare: str) -> str:
@@ -165,13 +181,14 @@ class PredictionResult(BaseModel):
     verdict: str               # "safe" | "suspicious" | "phishing"
     scores: dict               # per-model raw probabilities
     reasons: list[str]         # human-readable flags
+    model_input: str = ""      # 實際送進模型的字串（網域），方便和 n8n 對照
 
 
 # ──────────────────────────────────────────────
 # Core prediction logic
 # ──────────────────────────────────────────────
 def _predict_one(url: str) -> PredictionResult:
-    bare = _strip_scheme(url)          # 送進模型的網址（無協定）；回傳時仍用原始 url
+    bare = _to_domain(url)             # 送進模型的只有網域（見 _to_domain）；回傳時仍用原始 url
     if not bare:
         raise HTTPException(status_code=422, detail="url must not be empty")
     scores = {}
@@ -242,6 +259,7 @@ def _predict_one(url: str) -> PredictionResult:
         verdict=verdict,
         scores=scores,
         reasons=list(set(reasons)),
+        model_input=bare,
     )
 
 
