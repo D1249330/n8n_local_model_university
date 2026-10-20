@@ -45,6 +45,7 @@ XGB_FEATURE_COLS = [
 # CharCNN 前處理參數（模型結構見 convert_cnn_to_onnx.py；Render 上只用 ONNX，不需要 PyTorch）
 CNN_MAX_LEN = 200
 CNN_THRESHOLD = 0.4
+LSTM_THRESHOLD = 0.43   # 0805_three_model_workflow.md：三模型測試固定使用 0.43
 
 
 # ──────────────────────────────────────────────
@@ -70,12 +71,15 @@ async def lifespan(app: FastAPI):
     # ── LSTM ─────────────────────────────────
     try:
         import tensorflow as tf
-        lstm_model = tf.keras.models.load_model(os.path.join(BASE_DIR, "0802_lstm_model.keras"))
-        with open(os.path.join(BASE_DIR, "0802_lstm_config.json")) as f:
-            lstm_cfg = json.load(f)
-        lstm_threshold = float(lstm_cfg.get("threshold", 0.45))
-        _models["lstm"] = {"model": lstm_model, "threshold": lstm_threshold}
-        logger.info(f"LSTM loaded (threshold={lstm_threshold})")
+        # 依 0805_three_model_workflow.md 使用 0803 版；repo 裡還沒有 0803 時退回 0802
+        lstm_ver = next(v for v in ("0803", "0802")
+                        if os.path.exists(os.path.join(BASE_DIR, f"{v}_lstm_model.keras")))
+        lstm_model = tf.keras.models.load_model(
+            os.path.join(BASE_DIR, f"{lstm_ver}_lstm_model.keras"), compile=False)
+        lstm_threshold = LSTM_THRESHOLD   # 文件規定固定 0.43，不讀 config 檔
+        _models["lstm"] = {"model": lstm_model, "threshold": lstm_threshold,
+                           "file": f"{lstm_ver}_lstm_model.keras"}
+        logger.info(f"LSTM {lstm_ver} loaded (threshold={lstm_threshold})")
     except Exception as e:
         logger.warning(f"LSTM not loaded: {e}")
 
@@ -120,14 +124,14 @@ app.add_middleware(
 from transfer import extract_url_features   # noqa: E402  (local module)
 
 
-_SCHEME_RE = re.compile(r"^\s*https?://", re.IGNORECASE)
+_SCHEME_RE = re.compile(r"^\s*[a-z][a-z0-9+.-]*://", re.IGNORECASE)   # http:// https:// ftp:// … 都拿掉（同 n8n）
 _WWW_RE = re.compile(r"^www\d*\.", re.IGNORECASE)   # 和 n8n 一樣：www. / www1. / www2. 都拿掉
 
 
 def _to_domain(url: str) -> str:
     """把網址縮成主機名稱再送進模型，和 n8n 流程一致：
     https://www.youtube.com/watch?v=abc → youtube.com
-    1. 拿掉 http:// / https://
+    1. 拿掉任何協定（http:// https:// ftp:// …）
     2. 拿掉路徑、查詢字串、#片段（第一個 / ? # 之後全部丟掉）
     3. 拿掉帳號密碼（user@）與 port（:8080）
     4. 轉小寫、拿掉結尾的點與開頭的 www.（含 www1. 這類）
@@ -144,8 +148,17 @@ def _to_domain(url: str) -> str:
     return _WWW_RE.sub("", s)
 
 
-def _clean_for_lstm(bare: str) -> str:
-    return bare.lower().encode("ascii", "ignore").decode("ascii")
+def _clean_for_xgb(bare: str):
+    """文件 5.1：[.] (.) 還原成 .、轉小寫、去掉非 ASCII；空字串、.、.. 視為無效（回傳 None）"""
+    s = bare.replace("[.]", ".").replace("(.)", ".").strip().lower()
+    s = s.encode("ascii", "ignore").decode("ascii")
+    return None if s in {"", ".", ".."} else s
+
+
+def _clean_for_lstm(bare: str):
+    """文件 5.2：轉小寫、去掉非 ASCII；空字串、.、.. 視為無效"""
+    s = bare.strip().lower().encode("ascii", "ignore").decode("ascii")
+    return None if s in {"", ".", ".."} else s
 
 
 # ──────────────────────────────────────────────
@@ -199,7 +212,10 @@ def _predict_one(url: str) -> PredictionResult:
     if "xgb" in _models:
         try:
             import pandas as pd
-            feats = extract_url_features(bare)
+            xgb_in = _clean_for_xgb(bare)
+            if xgb_in is None:
+                raise ValueError("網址清理後為空，XGBoost 不判斷")
+            feats = extract_url_features(xgb_in, force_https=False)
             # 用 DataFrame 帶欄位名稱，模型會檢查特徵名稱與順序
             x = pd.DataFrame([[feats.get(c, 0) for c in XGB_FEATURE_COLS]], columns=XGB_FEATURE_COLS)
             prob = float(_models["xgb"]["model"].predict_proba(x)[0][1])
@@ -214,6 +230,8 @@ def _predict_one(url: str) -> PredictionResult:
         try:
             import tensorflow as tf
             clean = _clean_for_lstm(bare)
+            if clean is None:
+                raise ValueError("網址清理後為空，LSTM 不判斷")
             # 模型第一層是 TextVectorization（逐字元切分、長度 200），直接餵網址字串
             x = tf.constant([[clean]], dtype=tf.string)
             prob = float(_models["lstm"]["model"].predict(x, verbose=0)[0][0])
@@ -226,8 +244,8 @@ def _predict_one(url: str) -> PredictionResult:
     if "cnn" in _models:
         try:
             char2idx = _models["cnn"]["char2idx"]
-            clean = bare.lower()
-            ids = [char2idx.get(c, 0) for c in clean[:CNN_MAX_LEN]]
+            # 文件 5.3：CNN 只去協定，不轉小寫、不去非 ASCII（網域在 _to_domain 已是小寫）
+            ids = [char2idx.get(c, 0) for c in bare[:CNN_MAX_LEN]]
             ids = ids + [0] * (CNN_MAX_LEN - len(ids))
             x = np.array([ids], dtype=np.int64)
             sess = _models["cnn"]["session"]
@@ -291,6 +309,7 @@ def health():
         "model_version": MODEL_VERSION,
         "models_loaded": list(_models.keys()),
         "thresholds": {k: v.get("threshold") for k, v in _models.items()},
+        "lstm_file": _models.get("lstm", {}).get("file"),
     }
 
 

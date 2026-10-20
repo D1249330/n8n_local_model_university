@@ -16,8 +16,8 @@
 | `transfer.py` | XGBoost 用的網址特徵擷取（UF2–UF26） |
 | `0802_augmented_xgb_model.ubj` | XGBoost 模型（XGBoost 原生 UBJSON 格式） |
 | `0802_augmented_model_config.pkl` | XGBoost 門檻：`{"best_threshold": 0.26}` |
-| `0802_lstm_model.keras` | LSTM 模型（Keras 3，模型內含 `TextVectorization`，輸入是字串） |
-| `0802_lstm_config.json` | LSTM 門檻：`{"threshold": 0.43}` |
+| `0803_lstm_model.keras` | LSTM 模型（Keras 3，模型內含 `TextVectorization`，輸入是字串）。找不到時退回 `0802_lstm_model.keras`；實際載入哪個看 `/health` 的 `lstm_file` |
+| `0802_lstm_model.keras` | 舊版 LSTM，上傳 0803 後可刪除 |
 | `cnn_model.onnx` | CharCNN 模型（**Render 實際載入的是這個**） |
 | `char_cnn_model.pth` | CharCNN 的 PyTorch 權重，只用來轉成 ONNX，Render 不會讀 |
 | `tokenizer_CNN.pkl` | CharCNN 字元表（125 個字元，`<PAD>` = 0） |
@@ -32,7 +32,7 @@
 
 ```
 輸入網址
-  │  縮成網域：去掉 http(s)://、路徑、查詢字串、port、開頭的 www.
+  │  縮成網域：去掉任何協定、路徑、查詢字串、port、開頭的 www.
   │  例：https://www.youtube.com/watch?v=abc → youtube.com（與 n8n 流程一致）
   ▼
 ┌──────────────┬──────────────────┬──────────────────┐
@@ -52,9 +52,9 @@
 
 | 模型 | 輸入處理 | 門檻 |
 |---|---|---|
-| XGBoost | 縮成網域後交給 `extract_url_features()`，取 23 個特徵：UF2、UF3、UF4、UF5、UF6、UF8、UF10–UF26（不含 UF1、UF7、UF9），用 DataFrame 帶欄位名稱 | 0.26 |
-| LSTM | 縮成網域、去掉非 ASCII 字元，以字串送入模型（模型內的 `TextVectorization` 逐字元切分，長度 200） | 0.43 |
-| CharCNN | 縮成網域，用 `tokenizer_CNN.pkl` 轉成索引（找不到的字元 = 0），截斷或補 0 到長度 200 | 0.40 |
+| XGBoost | 縮成網域，`[.]`／`(.)` 還原成 `.`、轉小寫、去掉非 ASCII，交給 `extract_url_features(force_https=False)`，取 23 個特徵：UF2、UF3、UF4、UF5、UF6、UF8、UF10–UF26（不含 UF1、UF7、UF9），用 DataFrame 帶欄位名稱 | 0.26 |
+| LSTM | 縮成網域、轉小寫、去掉非 ASCII 字元，以字串送入模型（門檻固定 0.43，不讀 config 檔）（模型內的 `TextVectorization` 逐字元切分，長度 200） | 0.43 |
+| CharCNN | 縮成網域（不另外轉小寫、不去非 ASCII），用 `tokenizer_CNN.pkl` 轉成索引（找不到的字元 = 0），截斷或補 0 到長度 200 | 0.40 |
 
 ### CharCNN 結構
 
@@ -181,7 +181,7 @@ Render 服務連結這個 repo 的 `main` branch，**push 之後會自動重新�
 ## 更新模型
 
 1. **XGBoost**：放入新的 `.ubj` 與門檻 `.pkl`。特徵必須仍是 `transfer.py` 產生的同樣 23 個、同樣順序，否則要一起改 `XGB_FEATURE_COLS` 與 `transfer.py`。
-2. **LSTM**：放入新的 `.keras` 與門檻 `.json`。模型第一層必須是 `TextVectorization`（字串輸入）；如果改成整數輸入，`main.py` 的 LSTM 預測段要跟著改。
+2. **LSTM**：放入新的 `0803_lstm_model.keras`（或改 `main.py` 的檔名清單）；門檻寫在 `main.py` 的 `LSTM_THRESHOLD`。模型第一層必須是 `TextVectorization`（字串輸入）；如果改成整數輸入，`main.py` 的 LSTM 預測段要跟著改。
 3. **CharCNN**：放入新的 `char_cnn_model.pth`（字元表有變就一起換 `tokenizer_CNN.pkl`），在有 PyTorch 的環境執行：
    ```bash
    pip install torch onnx onnxscript onnxruntime
@@ -199,6 +199,13 @@ Render 服務連結這個 repo 的 `main` branch，**push 之後會自動重新�
 ---
 
 ## 更新紀錄
+
+### 0802 / LSTM 0803（2026-10-20）
+
+- 前處理對齊組員的 `0805_three_model_workflow.md` 第 5 節：XGBoost 先把 `[.]`、`(.)` 還原成 `.`、去掉非 ASCII；清理後為空（`""`、`.`、`..`）的網址該模型不判斷；CharCNN 不另外轉小寫。
+- 任何協定（`ftp://` 等）都會拿掉，與 n8n 一致；舊版 `ftp://…` 會被誤縮成 `ftp`。
+- LSTM 改用文件指定的 `0803_lstm_model.keras`（沒有時退回 0802），門檻固定 0.43；`/health` 新增 `lstm_file`。
+- 判定（`verdict`、`confidence`）仍用三個機率的平均，與文件的多數決不同；`is_phishing` 是多數決。
 
 ### 0802-domain（2026-10-18）
 
