@@ -30,10 +30,13 @@
 
 ## 判斷流程
 
-完全依照 `0805_three_model_workflow.md`（等同 `0805_three_model_test.py`）：送進模型的是**完整網址**，三個模型各自清理，再以三模型硬投票決定結果。
+依照 `0805_three_model_workflow.md`（等同 `0805_three_model_test.py`）：送進模型的是**完整網址**，三個模型各自清理，再以三模型硬投票決定結果。
+
+唯一的額外規則：**先拿掉開頭的 `www.`**（含 `www1.`、`www[.]`），路徑與參數保留，例如 `https://www.youtube.com/watch?v=abc` → `https://youtube.com/watch?v=abc`。n8n 送給本機模型服務前也做同樣處理。
 
 ```
 輸入網址（完整，不縮成網域）
+       │  拿掉開頭的 www.（本專案額外規則）
        │
 ┌──────┴────────┬───────────────────┬────────────────────┐
 │ XGBoost       │ LSTM              │ CharCNN (ONNX)     │
@@ -101,7 +104,7 @@ Linear(64, 1) + Sigmoid
 ```json
 {
   "status": "ok",
-  "model_version": "0802-md",
+  "model_version": "0802-md-www",
   "models_loaded": ["xgb", "lstm", "cnn"],
   "thresholds": { "xgb": 0.26, "lstm": 0.43, "cnn": 0.4 },
   "lstm_file": "0803_lstm_model.keras"
@@ -207,6 +210,12 @@ Render 服務連結這個 repo 的 `main` branch，**push 之後會自動重新�
 ---
 
 ## 更新紀錄
+
+### 0802-md-www（2026-10-20）
+
+- 在 md 檔的前處理之前，先拿掉開頭的 `www.`（含 `www1.`、`www[.]`），其餘不變；`url` 欄位仍回傳原始網址。
+- 目的：避開 LSTM、CharCNN 對「`www.` 加路徑」的誤判。例如 `https://www.youtube.com/watch?v=_DymcG1A8Kg` 從三票中兩票（釣魚）變成一票（安全），`https://www.google.com/` 從兩票變成零票。
+- 沒有 `www.` 的網址（例如 `https://youtu.be/…?si=…`）結果不變。
 
 ### 0802-md（2026-10-20）
 

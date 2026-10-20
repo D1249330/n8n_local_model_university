@@ -29,7 +29,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("phishguard")
 
 BASE_DIR = os.path.dirname(__file__)
-MODEL_VERSION = "0802-md"
+MODEL_VERSION = "0802-md-www"
 
 # ──────────────────────────────────────────────
 # Model state (loaded once at startup)
@@ -127,6 +127,15 @@ from transfer import extract_url_features   # noqa: E402  (local module)
 # ── 前處理：完全依照 0805_three_model_workflow.md 第 5 節（= 0805_three_model_test.py）──
 # 送進模型的是完整網址（只拿掉協定），不縮成網域。三個模型的清理方式各不相同，不能混用。
 
+# 本專案額外規則（md 檔沒有）：開頭的 www.（含 www1.、www[.]）先拿掉，路徑與參數保留，和 n8n 一致
+# https://www.youtube.com/watch?v=abc → https://youtube.com/watch?v=abc
+_WWW_RE = re.compile(r"^(\s*(?:[a-zA-Z][a-zA-Z0-9+.-]*://)?)www\d*(?:\.|\[\.\]|\(\.\))", re.IGNORECASE)
+
+
+def _strip_www(url: str) -> str:
+    return _WWW_RE.sub(r"\1", str(url), count=1)
+
+
 def _clean_url(url: str, strip_any_scheme: bool):
     """0805 的 clean_url()：XGBoost 用 strip_any_scheme=True，LSTM 用 False"""
     s = str(url).replace("[.]", ".").replace("(.)", ".").strip()
@@ -186,6 +195,8 @@ class PredictionResult(BaseModel):
 def _predict_one(url: str) -> PredictionResult:
     if not str(url).strip():
         raise HTTPException(status_code=422, detail="url must not be empty")
+    original_url = url
+    url = _strip_www(url)              # 先拿掉 www.，之後完全照 md 檔前處理
     scores, votes, reasons, inputs = {}, {}, [], {}
 
     # ── XGBoost（文件 5.1、7.1）────────────────
@@ -235,12 +246,12 @@ def _predict_one(url: str) -> PredictionResult:
     # ── 三模型硬投票（文件第 8 節）──────────────
     # 任一模型沒有有效預測 → 依文件不判定（NaN）
     if len(votes) < 3:
-        return PredictionResult(url=url, is_phishing=None, confidence=None, verdict="unknown",
+        return PredictionResult(url=original_url, is_phishing=None, confidence=None, verdict="unknown",
                                 scores=scores, votes=votes, reasons=sorted(set(reasons)), model_input=inputs)
     total = sum(votes.values())
     y_pred = 1 if total >= 2 else 0
     return PredictionResult(
-        url=url,
+        url=original_url,
         is_phishing=bool(y_pred),
         confidence=round(total / 3.0, 4),
         verdict="phishing" if y_pred else "safe",
