@@ -29,7 +29,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("phishguard")
 
 BASE_DIR = os.path.dirname(__file__)
-MODEL_VERSION = "0802"
+MODEL_VERSION = "0802-md"
 
 # ──────────────────────────────────────────────
 # Model state (loaded once at startup)
@@ -124,41 +124,23 @@ app.add_middleware(
 from transfer import extract_url_features   # noqa: E402  (local module)
 
 
-_SCHEME_RE = re.compile(r"^\s*[a-z][a-z0-9+.-]*://", re.IGNORECASE)   # http:// https:// ftp:// … 都拿掉（同 n8n）
-_WWW_RE = re.compile(r"^www\d*\.", re.IGNORECASE)   # 和 n8n 一樣：www. / www1. / www2. 都拿掉
+# ── 前處理：完全依照 0805_three_model_workflow.md 第 5 節（= 0805_three_model_test.py）──
+# 送進模型的是完整網址（只拿掉協定），不縮成網域。三個模型的清理方式各不相同，不能混用。
 
-
-def _to_domain(url: str) -> str:
-    """把網址縮成主機名稱再送進模型，和 n8n 流程一致：
-    https://www.youtube.com/watch?v=abc → youtube.com
-    1. 拿掉任何協定（http:// https:// ftp:// …）
-    2. 拿掉路徑、查詢字串、#片段（第一個 / ? # 之後全部丟掉）
-    3. 拿掉帳號密碼（user@）與 port（:8080）
-    4. 轉小寫、拿掉結尾的點與開頭的 www.（含 www1. 這類）
-    其他子網域保留（paypal.com.evil.xyz 這類冒用手法要靠它判斷）。
-    """
-    s = _SCHEME_RE.sub("", url.strip()).strip()
-    s = re.split(r"[/?#\\]", s, maxsplit=1)[0]
-    s = s.rsplit("@", 1)[-1]
-    if s.startswith("["):                  # IPv6：[::1]:8080
-        s = s.split("]", 1)[0] + "]"
+def _clean_url(url: str, strip_any_scheme: bool):
+    """0805 的 clean_url()：XGBoost 用 strip_any_scheme=True，LSTM 用 False"""
+    s = str(url).replace("[.]", ".").replace("(.)", ".").strip()
+    if strip_any_scheme:
+        s = re.sub(r"^[a-zA-Z]+://", "", s)
     else:
-        s = s.split(":", 1)[0]
-    s = s.lower().rstrip(".")
-    return _WWW_RE.sub("", s)
-
-
-def _clean_for_xgb(bare: str):
-    """文件 5.1：[.] (.) 還原成 .、轉小寫、去掉非 ASCII；空字串、.、.. 視為無效（回傳 None）"""
-    s = bare.replace("[.]", ".").replace("(.)", ".").strip().lower()
-    s = s.encode("ascii", "ignore").decode("ascii")
+        s = re.sub(r"^https?://", "", s, flags=re.IGNORECASE)
+    s = s.strip().lower().encode("ascii", "ignore").decode("ascii")
     return None if s in {"", ".", ".."} else s
 
 
-def _clean_for_lstm(bare: str):
-    """文件 5.2：轉小寫、去掉非 ASCII；空字串、.、.. 視為無效"""
-    s = bare.strip().lower().encode("ascii", "ignore").decode("ascii")
-    return None if s in {"", ".", ".."} else s
+def _clean_url_cnn(url: str) -> str:
+    """0805 的 clean_url_cnn()：只拿掉 http(s)://，不轉小寫、不還原 [.]、不去非 ASCII"""
+    return re.sub(r"^https?://", "", str(url).strip(), flags=re.IGNORECASE)
 
 
 # ──────────────────────────────────────────────
@@ -189,95 +171,83 @@ class BatchRequest(BaseModel):
 
 class PredictionResult(BaseModel):
     url: str
-    is_phishing: bool
-    confidence: float          # 0–1, higher = more likely phishing
-    verdict: str               # "safe" | "suspicious" | "phishing"
-    scores: dict               # per-model raw probabilities
-    reasons: list[str]         # human-readable flags
-    model_input: str = ""      # 實際送進模型的字串（網域），方便和 n8n 對照
+    is_phishing: Optional[bool]      # 多數決（y_pred）；任一模型沒有結果時為 null，依文件不判定
+    confidence: Optional[float]      # 投票比例 y_prob = 判為 1 的模型數 / 3（0、0.3333、0.6667、1）
+    verdict: str                     # "phishing"（y_pred=1）| "safe"（y_pred=0）| "unknown"（不判定）
+    scores: dict                     # 各模型原始機率 xgb_prob / lstm_prob / cnn_prob
+    votes: dict = {}                 # 各模型 0/1 預測 xgb_pred / lstm_pred / cnn_pred
+    reasons: list[str]               # XGBoost 特徵對應的中文說明
+    model_input: dict = {}           # 各模型實際收到的字串
 
 
 # ──────────────────────────────────────────────
 # Core prediction logic
 # ──────────────────────────────────────────────
 def _predict_one(url: str) -> PredictionResult:
-    bare = _to_domain(url)             # 送進模型的只有網域（見 _to_domain）；回傳時仍用原始 url
-    if not bare:
+    if not str(url).strip():
         raise HTTPException(status_code=422, detail="url must not be empty")
-    scores = {}
-    votes = []
-    reasons = []
+    scores, votes, reasons, inputs = {}, {}, [], {}
 
-    # ── XGBoost ──────────────────────────────
+    # ── XGBoost（文件 5.1、7.1）────────────────
     if "xgb" in _models:
         try:
             import pandas as pd
-            xgb_in = _clean_for_xgb(bare)
-            if xgb_in is None:
-                raise ValueError("網址清理後為空，XGBoost 不判斷")
-            feats = extract_url_features(xgb_in, force_https=False)
-            # 用 DataFrame 帶欄位名稱，模型會檢查特徵名稱與順序
-            x = pd.DataFrame([[feats.get(c, 0) for c in XGB_FEATURE_COLS]], columns=XGB_FEATURE_COLS)
-            prob = float(_models["xgb"]["model"].predict_proba(x)[0][1])
-            scores["xgboost"] = round(prob, 4)
-            votes.append(prob >= _models["xgb"]["threshold"])
-            _add_reasons(feats, reasons)
+            xgb_in = _clean_url(url, strip_any_scheme=True)
+            if xgb_in is not None:
+                inputs["xgb"] = xgb_in
+                feats = extract_url_features(xgb_in, force_https=False)
+                x = pd.DataFrame([[feats.get(c, 0) for c in XGB_FEATURE_COLS]], columns=XGB_FEATURE_COLS)
+                prob = float(_models["xgb"]["model"].predict_proba(x)[0][1])
+                scores["xgb"] = round(prob, 4)
+                votes["xgb"] = int(prob >= _models["xgb"]["threshold"])
+                _add_reasons(feats, reasons)
         except Exception as e:
             logger.warning(f"XGB predict error: {e}")
 
-    # ── LSTM ─────────────────────────────────
+    # ── LSTM（文件 5.2、7.2）───────────────────
     if "lstm" in _models:
         try:
             import tensorflow as tf
-            clean = _clean_for_lstm(bare)
-            if clean is None:
-                raise ValueError("網址清理後為空，LSTM 不判斷")
-            # 模型第一層是 TextVectorization（逐字元切分、長度 200），直接餵網址字串
-            x = tf.constant([[clean]], dtype=tf.string)
-            prob = float(_models["lstm"]["model"].predict(x, verbose=0)[0][0])
-            scores["lstm"] = round(prob, 4)
-            votes.append(prob >= _models["lstm"]["threshold"])
+            lstm_in = _clean_url(url, strip_any_scheme=False)
+            if lstm_in is not None:
+                inputs["lstm"] = lstm_in
+                prob = float(_models["lstm"]["model"].predict(tf.constant([[lstm_in]], dtype=tf.string), verbose=0)[0][0])
+                scores["lstm"] = round(prob, 4)
+                votes["lstm"] = int(prob >= _models["lstm"]["threshold"])
         except Exception as e:
             logger.warning(f"LSTM predict error: {e}")
 
-    # ── CharCNN (ONNX) ────────────────────────
+    # ── CharCNN（文件 5.3、7.3）────────────────
     if "cnn" in _models:
         try:
+            cnn_in = _clean_url_cnn(url)
+            inputs["cnn"] = cnn_in
             char2idx = _models["cnn"]["char2idx"]
-            # 文件 5.3：CNN 只去協定，不轉小寫、不去非 ASCII（網域在 _to_domain 已是小寫）
-            ids = [char2idx.get(c, 0) for c in bare[:CNN_MAX_LEN]]
+            ids = [char2idx.get(c, 0) for c in cnn_in][:CNN_MAX_LEN]
             ids = ids + [0] * (CNN_MAX_LEN - len(ids))
-            x = np.array([ids], dtype=np.int64)
-            sess = _models["cnn"]["session"]
-            out = sess.run(None, {"input": x})
+            out = _models["cnn"]["session"].run(None, {"input": np.array([ids], dtype=np.int64)})
             prob = float(out[0][0])
             scores["cnn"] = round(prob, 4)
-            votes.append(prob >= _models["cnn"]["threshold"])
+            votes["cnn"] = int(prob >= _models["cnn"]["threshold"])
         except Exception as e:
             logger.warning(f"CNN predict error: {e}")
 
-    if not scores:
-        raise HTTPException(status_code=503, detail="No models available")
-
-    # Ensemble: average probability
-    avg_prob = sum(scores.values()) / len(scores)
-    is_phishing = sum(votes) > len(votes) / 2   # majority vote
-
-    if avg_prob >= 0.65:
-        verdict = "phishing"
-    elif avg_prob >= 0.40:
-        verdict = "suspicious"
-    else:
-        verdict = "safe"
-
+    # ── 三模型硬投票（文件第 8 節）──────────────
+    # 任一模型沒有有效預測 → 依文件不判定（NaN）
+    if len(votes) < 3:
+        return PredictionResult(url=url, is_phishing=None, confidence=None, verdict="unknown",
+                                scores=scores, votes=votes, reasons=sorted(set(reasons)), model_input=inputs)
+    total = sum(votes.values())
+    y_pred = 1 if total >= 2 else 0
     return PredictionResult(
         url=url,
-        is_phishing=is_phishing,
-        confidence=round(avg_prob, 4),
-        verdict=verdict,
+        is_phishing=bool(y_pred),
+        confidence=round(total / 3.0, 4),
+        verdict="phishing" if y_pred else "safe",
         scores=scores,
-        reasons=list(set(reasons)),
-        model_input=bare,
+        votes=votes,
+        reasons=sorted(set(reasons)),
+        model_input=inputs,
     )
 
 

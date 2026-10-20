@@ -3,7 +3,7 @@
 以 **XGBoost + LSTM + CharCNN** 三個模型集成判斷網址是否為釣魚網站，用 FastAPI 提供 HTTP API，部署在 Render。
 
 - 線上網址：`https://n8n-local-model-university.onrender.com`
-- 目前模型版本：**0802**
+- 目前模型版本：**0802**（LSTM 0803），判斷流程完全依照組員的 `0805_three_model_workflow.md`
 - 使用者：PhishGuard 網站（`server.py` 轉發）、Chrome 擴充功能、n8n workflow
 
 ---
@@ -30,31 +30,32 @@
 
 ## 判斷流程
 
+完全依照 `0805_three_model_workflow.md`（等同 `0805_three_model_test.py`）：送進模型的是**完整網址**，三個模型各自清理，再以三模型硬投票決定結果。
+
 ```
-輸入網址
-  │  縮成網域：去掉任何協定、路徑、查詢字串、port、開頭的 www.
-  │  例：https://www.youtube.com/watch?v=abc → youtube.com（與 n8n 流程一致）
-  ▼
-┌──────────────┬──────────────────┬──────────────────┐
-│ XGBoost      │ LSTM             │ CharCNN (ONNX)   │
-│ 23 個網址特徵 │ 轉小寫、只留 ASCII │ 轉小寫           │
-│ (transfer.py)│ 直接餵字串        │ 字元表編碼、長度 200│
-└──────┬───────┴────────┬─────────┴────────┬─────────┘
-       ▼                ▼                  ▼
-   釣魚機率 0~1      釣魚機率 0~1        釣魚機率 0~1
-       └────────────────┼──────────────────┘
-                        ▼
-              平均機率 → verdict
-              多數決   → is_phishing
+輸入網址（完整，不縮成網域）
+       │
+┌──────┴────────┬───────────────────┬────────────────────┐
+│ XGBoost       │ LSTM              │ CharCNN (ONNX)     │
+│ 還原 [.] (.)  │ 還原 [.] (.)       │ 只拿掉 http(s)://   │
+│ 拿掉任何協定   │ 只拿掉 http(s)://  │ 不轉小寫            │
+│ 轉小寫、只留ASCII│ 轉小寫、只留 ASCII │ 字元表編碼、長度 200 │
+│ 23 個網址特徵  │ 直接餵字串         │                    │
+└──────┬────────┴─────────┬─────────┴──────────┬─────────┘
+   機率 ≥ 0.26 → 1     機率 ≥ 0.43 → 1      機率 ≥ 0.40 → 1
+       └──────────────────┼────────────────────┘
+                          ▼
+          三模型硬投票：至少 2 票 → phishing，否則 safe
+          任一模型沒有結果 → unknown（不判定）
 ```
 
-### 各模型前處理
+### 各模型前處理（文件第 5 節）
 
 | 模型 | 輸入處理 | 門檻 |
 |---|---|---|
-| XGBoost | 縮成網域，`[.]`／`(.)` 還原成 `.`、轉小寫、去掉非 ASCII，交給 `extract_url_features(force_https=False)`，取 23 個特徵：UF2、UF3、UF4、UF5、UF6、UF8、UF10–UF26（不含 UF1、UF7、UF9），用 DataFrame 帶欄位名稱 | 0.26 |
-| LSTM | 縮成網域、轉小寫、去掉非 ASCII 字元，以字串送入模型（門檻固定 0.43，不讀 config 檔）（模型內的 `TextVectorization` 逐字元切分，長度 200） | 0.43 |
-| CharCNN | 縮成網域（不另外轉小寫、不去非 ASCII），用 `tokenizer_CNN.pkl` 轉成索引（找不到的字元 = 0），截斷或補 0 到長度 200 | 0.40 |
+| XGBoost | `[.]`／`(.)` 還原成 `.`、拿掉任何協定（`^[a-zA-Z]+://`）、轉小寫、去掉非 ASCII；結果為 `""`、`.`、`..` 視為無效。交給 `extract_url_features(force_https=False)`，取 23 個特徵：UF2、UF3、UF4、UF5、UF6、UF8、UF10–UF26（不含 UF7、UF9） | 0.26 |
+| LSTM | `[.]`／`(.)` 還原成 `.`、只拿掉 `http(s)://`、轉小寫、去掉非 ASCII，以字串送入模型（模型內的 `TextVectorization` 逐字元切分，長度 200） | 0.43（固定，不讀 config 檔） |
+| CharCNN | 只拿掉 `http(s)://`，**不轉小寫、不還原 `[.]`、不去非 ASCII**；用 `tokenizer_CNN.pkl` 轉成索引（找不到的字元 = 0），截斷或補 0 到長度 200 | 0.40 |
 
 ### CharCNN 結構
 
@@ -67,12 +68,12 @@ Linear(64, 64) + ReLU + Dropout(0.3)
 Linear(64, 1) + Sigmoid
 ```
 
-### 集成規則
+### 投票規則（文件第 8 節）
 
-- `confidence` = 三個模型釣魚機率的**平均**
-- `verdict`：平均 ≥ 0.65 → `phishing`；≥ 0.40 → `suspicious`；其餘 → `safe`
-- `is_phishing`：各模型與自己的門檻比較後**多數決**
-- 某個模型載入或預測失敗時只會記 log 並略過，用剩下的模型繼續算（所以部署後一定要看 `/health`）
+- 每個模型的機率和自己的門檻比較，得到 0/1（`votes`）
+- `is_phishing`：至少 2 個模型為 1 → `true`，否則 `false`
+- `confidence`：判為 1 的模型數 / 3（`0`、`0.3333`、`0.6667`、`1`），**不是**三個機率的平均
+- `verdict`：`phishing`（至少 2 票）或 `safe`；任一模型沒有有效結果 → `unknown`，`is_phishing` 與 `confidence` 為 `null`
 
 ### `reasons`（判斷依據）
 
@@ -100,9 +101,10 @@ Linear(64, 1) + Sigmoid
 ```json
 {
   "status": "ok",
-  "model_version": "0802",
+  "model_version": "0802-md",
   "models_loaded": ["xgb", "lstm", "cnn"],
-  "thresholds": { "xgb": 0.26, "lstm": 0.43, "cnn": 0.4 }
+  "thresholds": { "xgb": 0.26, "lstm": 0.43, "cnn": 0.4 },
+  "lstm_file": "0803_lstm_model.keras"
 }
 ```
 
@@ -120,25 +122,31 @@ curl -X POST https://n8n-local-model-university.onrender.com/predict \
 {
   "url": "https://paypa1-secure-login.verify-account.xyz/signin.php",
   "is_phishing": true,
-  "confidence": 0.9999,
+  "confidence": 1.0,
   "verdict": "phishing",
-  "scores": { "xgboost": 0.9999, "lstm": 0.9999, "cnn": 1.0 },
+  "scores": { "xgb": 0.9999, "lstm": 0.9999, "cnn": 1.0 },
+  "votes": { "xgb": 1, "lstm": 1, "cnn": 1 },
   "reasons": ["主機名稱含有連字號 (-)", "使用高風險頂級域名（.sbs / .xyz…）", "含有敏感關鍵字（login / verify / bank…）"],
-  "model_input": "paypa1-secure-login.verify-account.xyz"
+  "model_input": {
+    "xgb": "paypa1-secure-login.verify-account.xyz/signin.php",
+    "lstm": "paypa1-secure-login.verify-account.xyz/signin.php",
+    "cnn": "paypa1-secure-login.verify-account.xyz/signin.php"
+  }
 }
 ```
 
 | 欄位 | 說明 |
 |---|---|
-| `url` | 使用者原本輸入的網址（含協定也照原樣回傳） |
-| `is_phishing` | 多數決結果 |
-| `confidence` | 平均釣魚機率，0~1，越高越可能是釣魚 |
-| `verdict` | `safe` / `suspicious` / `phishing` |
+| `url` | 使用者原本輸入的網址 |
+| `is_phishing` | 多數決結果；無法判定時為 `null` |
+| `confidence` | 投票比例（判為釣魚的模型數 / 3）；無法判定時為 `null` |
+| `verdict` | `safe` / `phishing` / `unknown` |
 | `scores` | 各模型的釣魚機率 |
+| `votes` | 各模型和門檻比較後的 0/1 |
 | `reasons` | 命中的規則特徵 |
-| `model_input` | 實際送進模型的字串（網域），用來和 n8n 對照 |
+| `model_input` | 各模型實際收到的字串 |
 
-錯誤：網址是空的或只有 `https://` → `422`；三個模型都不能用 → `503`。
+錯誤：網址是空的 → `422`。
 
 ### `POST /predict/batch`
 
@@ -199,6 +207,13 @@ Render 服務連結這個 repo 的 `main` branch，**push 之後會自動重新�
 ---
 
 ## 更新紀錄
+
+### 0802-md（2026-10-20）
+
+- 判斷流程改成完全依照 `0805_three_model_workflow.md`：送完整網址（不再縮成網域），三個模型各自照文件清理。
+- 最後判定改用三模型硬投票：`verdict` 只有 `phishing`／`safe`，`confidence` 改為投票比例；任一模型沒有結果時回 `unknown`。
+- 回應新增 `votes`；`scores` 的鍵改為 `xgb`／`lstm`／`cnn`；`model_input` 改為各模型實際收到的字串。
+- 注意：這會重新出現 LSTM 對「`www.` 加路徑」的偏差，例如 `https://www.google.com/` 會被判為釣魚（XGBoost 0、LSTM 1、CNN 1）。
 
 ### 0802 / LSTM 0803（2026-10-20）
 
